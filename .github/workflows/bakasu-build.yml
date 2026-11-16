@@ -1,0 +1,120 @@
+# build.yml kanged from Rezoss Reza modified to build kernel with BakaSU using the main branch
+name: Build kernel (BakaSU, `main` branch)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 5 * * 1'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+       contents: write
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v6
+
+      - name: Set up the toolchain
+        run: |
+          sudo apt update
+          sudo apt install -y --no-install-recommends \
+            bc bison build-essential curl flex gh \
+            g++-multilib gcc-multilib git gnupg \
+            lib32readline-dev lib32z1-dev \
+            libelf-dev liblz4-tool libssl-dev \
+            lzop zlib1g-dev pahole dwarves cpio zip \
+            python3 python-is-python3 tar perl lz4 jq
+
+      - name: Download anykernel.zip
+        run: |
+          wget -q https://github.com/gyabii/kernel_samsung_sm8550-common/releases/download/anykernel/anykernel.zip
+
+      - name: Apply BakaSU
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          echo "KERNEL_VERSION=$(grep -m1 '^SUBLEVEL =' ./Makefile | awk '{print $3}')" >> $GITHUB_ENV
+          curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
+
+          # Locate the directory setup.sh created (drivers/kernelsu -> <dir>/kernel)
+          KSU_DIR="$(dirname "$(dirname "$(readlink -f drivers/kernelsu)")")"
+          # Total number of commits on BakaSU main (asked from the GitHub API,
+          # the local clone can be shallow). Only used as a fallback for the zip name.
+          KSU_ID="$(curl -fsSI -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/Baka-SU/BakaSU/commits?sha=main&per_page=1" \
+            | grep -i '^link:' | sed -n 's/.*[?&]page=\([0-9]*\)>; rel="last".*/\1/p')" || true
+          if [ -z "${KSU_ID:-}" ]; then
+            git -C "$KSU_DIR" fetch --unshallow || true
+            KSU_ID="$(git -C "$KSU_DIR" rev-list --count HEAD)"
+          fi
+          echo "KSU_ID=$KSU_ID" >> $GITHUB_ENV
+          CONFIG_FILE=arch/arm64/configs/gki_defconfig
+          # Kernel name: "5.15.220-VoidKernel" instead of "5.15.220-g<hash>"
+          sed -i '/^CONFIG_LOCALVERSION=/d;/^CONFIG_LOCALVERSION_AUTO[= ]/d;/^# CONFIG_LOCALVERSION_AUTO is not set/d' "$CONFIG_FILE"
+          cat >> "$CONFIG_FILE" << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_LOCALVERSION="-VoidKernel"
+          # CONFIG_LOCALVERSION_AUTO is not set
+          EOF
+
+      - name: Set up swap space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 16
+
+      - name: Build the kernel
+        run: |
+          git config --global user.email "gyabii@proton.me"
+          git config --global user.name "gyabii"
+          chmod +x scripts/build.sh
+          ./scripts/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          if [ ! -f "out/arch/arm64/boot/Image.gz" ]; then
+            echo "ERROR: Kernel compilation failed! out/arch/arm64/boot/Image.gz not found."
+            exit 1
+          fi
+
+      - name: Package image with AnyKernel3
+        id: package
+        run: |
+          BUILD_DATE="$(date)"
+          TIMESTAMP="$(date +%d%m%y-%H%M%S)"
+          set -euxo pipefail
+          # Version shown by the BakaSU manager (e.g. 35236): the KSU_VERSION compiled
+          # into the driver. Fallback: 30000 + commit count.
+          CI_ID="$(grep -rhoE 'DKSU_VERSION=[0-9]+' out/drivers 2>/dev/null | head -n1 | cut -d= -f2 || true)"
+          CI_ID="${CI_ID:-$((30000 + KSU_ID))}"
+          unzip "anykernel.zip" -d anykernel/
+          cp out/arch/arm64/boot/Image.gz anykernel/
+          touch -a -m -t 200901010000.00 "anykernel/Image.gz"
+          ZIP_NAME="S23kernel-5.15.${KERNEL_VERSION}_bakasu-${CI_ID}_$(date +%d%m%Y)"
+          cd anykernel
+          zip -r0 ../"${ZIP_NAME}".zip ./*
+          cd ..
+          HASH=$(sha256sum "${ZIP_NAME}.zip" | awk '{print $1}')
+          cat >> "release_notes.md" << EOF
+          Built at: ${BUILD_DATE}
+          
+          sha256:
+          \`\`\`
+          ${HASH}
+          \`\`\`
+          EOF
+          echo "zip_full_path=$GITHUB_WORKSPACE/${ZIP_NAME}.zip" >> "$GITHUB_OUTPUT"
+          echo "zip_name=${ZIP_NAME}.zip" >> "$GITHUB_OUTPUT"
+          echo "tag_name=common-bakasu-5.15.${KERNEL_VERSION}-${TIMESTAMP}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the flashable kernel
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.zip_name }}
+          path: anykernel/
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: "BakaSU 5.15.${{ env.KERNEL_VERSION }} common kernel"
+          tag_name: ${{ steps.package.outputs.tag_name }}
+          files: ${{ steps.package.outputs.zip_full_path }}
+          body_path: release_notes.md
+          make_latest: true
